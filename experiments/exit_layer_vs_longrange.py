@@ -33,6 +33,7 @@ def load_model_and_tokenizer(model_name: str):
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         dtype=torch.float16,
+        attn_implementation="eager",
         trust_remote_code=True,
     )
     model = model.cuda() if torch.cuda.is_available() else model
@@ -300,7 +301,8 @@ def subgroup_analysis(exit_layers, lr_mass, token_ids, tokenizer, freq_table):
     results = {}
 
     tok_array = np.array(token_ids)
-    decoded = [tokenizer.decode([t]) for t in tok_array[:min(len(tok_array), 50000)]]
+    n = len(tok_array)
+    decoded = [tokenizer.decode([t]) for t in tok_array]
 
     # Proper nouns / numbers: token starts with capital or digit
     is_rare_start = np.array([
