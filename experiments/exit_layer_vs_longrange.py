@@ -113,12 +113,17 @@ def compute_exit_layers(model, input_ids: torch.Tensor, targets: torch.Tensor):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def compute_attention_metrics(model, input_ids: torch.Tensor):
+def compute_attention_metrics(model, input_ids: torch.Tensor, lr_threshold: int = 128,
+                               sink_positions: int = 4, sweep_thresholds: tuple = (32, 64, 128, 256, 512)):
     """
     Returns:
         attn_dist: (seq_len,) average attention distance (metric A), averaged over all layers/heads
-        lr_mass:   (seq_len,) fraction of attention mass on positions >128 away (metric B), averaged
+        lr_mass:   (seq_len,) fraction of attention mass on positions >lr_threshold away (metric B), averaged
         per_layer_lr_mass: (num_layers, seq_len) lr_mass per layer (averaged over heads within layer)
+        lr_mass_by_threshold: dict {threshold: (seq_len,) array} for threshold sensitivity analysis
+
+    Attention on the first `sink_positions` key positions is zeroed out before computing
+    metrics, to avoid counting "attention sink" artifacts (Xiao et al. 2024) as long-range dependency.
     """
     outputs = model(
         input_ids=input_ids,
@@ -133,11 +138,20 @@ def compute_attention_metrics(model, input_ids: torch.Tensor):
 
     positions = torch.arange(seq_len, device=device, dtype=torch.float32)
     dist_matrix = (positions.unsqueeze(1) - positions.unsqueeze(0)).abs()  # (seq_len, seq_len)
-    lr_mask = (dist_matrix > 128).float()  # (seq_len, seq_len)
+    lr_mask = (dist_matrix > lr_threshold).float()  # (seq_len, seq_len)
+
+    # Sink mask: zero out attention to the first K key positions before metric computation.
+    # This prevents BOS/early-position attention sinks from inflating long-range metrics.
+    sink_mask = torch.ones(seq_len, device=device)
+    sink_mask[:sink_positions] = 0.0  # (seq_len,) — applied along key dimension
+
+    # Precompute lr_masks for all sweep thresholds
+    lr_masks = {th: (dist_matrix > th).float() for th in sweep_thresholds}
 
     sum_dist = torch.zeros(seq_len, device=device)
     sum_lr_mass = torch.zeros(seq_len, device=device)
     per_layer_lr_mass = torch.zeros(num_layers, seq_len, device=device)
+    sum_lr_mass_by_threshold = {th: torch.zeros(seq_len, device=device) for th in sweep_thresholds}
     total_contributions = 0
 
     for layer_idx, attn in enumerate(attentions):
@@ -145,23 +159,34 @@ def compute_attention_metrics(model, input_ids: torch.Tensor):
         attn = attn[0].float()  # (num_heads, seq_len, seq_len)
         num_heads = attn.shape[0]
 
+        # Zero out attention to sink positions and renormalize
+        attn = attn * sink_mask.unsqueeze(0).unsqueeze(0)  # (num_heads, seq_len, seq_len)
+        attn_sum = attn.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        attn = attn / attn_sum  # renormalize so rows sum to 1
+
         # metric A: weighted average distance per query token, per head
         weighted_dist = (attn * dist_matrix.unsqueeze(0)).sum(dim=-1)  # (num_heads, seq_len)
         sum_dist += weighted_dist.sum(dim=0)
 
-        # metric B: fraction of attention on positions |t - j| > 128
+        # metric B: fraction of attention on positions > lr_threshold away
         lr_weight = (attn * lr_mask.unsqueeze(0)).sum(dim=-1)  # (num_heads, seq_len)
         sum_lr_mass += lr_weight.sum(dim=0)
 
         # Per-layer lr_mass: average over heads for this layer
         per_layer_lr_mass[layer_idx] = lr_weight.mean(dim=0)
 
+        # Threshold sweep: accumulate lr_mass at each threshold
+        for th in sweep_thresholds:
+            th_weight = (attn * lr_masks[th].unsqueeze(0)).sum(dim=-1)  # (num_heads, seq_len)
+            sum_lr_mass_by_threshold[th] += th_weight.sum(dim=0)
+
         total_contributions += num_heads
 
     attn_dist = (sum_dist / total_contributions).cpu()
     lr_mass = (sum_lr_mass / total_contributions).cpu()
     per_layer_lr_mass = per_layer_lr_mass.cpu()
-    return attn_dist, lr_mass, per_layer_lr_mass
+    lr_mass_by_threshold = {th: (v / total_contributions).cpu() for th, v in sum_lr_mass_by_threshold.items()}
+    return attn_dist, lr_mass, per_layer_lr_mass, lr_mass_by_threshold
 
 
 def compute_layer_specific_metrics(exit_layers_chunk, per_layer_lr_mass):
@@ -194,40 +219,57 @@ def compute_layer_specific_metrics(exit_layers_chunk, per_layer_lr_mass):
 
 
 @torch.no_grad()
-def compute_kl_metric(model, input_ids: torch.Tensor, trunc_len: int = 256):
+def compute_kl_metric(model, input_ids: torch.Tensor, mask_beyond: int = 256):
     """
-    Metric C: KL(P_full || P_trunc) for each token.
+    Metric C: KL(P_full || P_masked) for each token, using per-position attention masking.
+
+    Instead of truncating the sequence (which changes RoPE positions, LayerNorm stats, etc.),
+    we keep the full sequence but mask out attention to positions j < t - mask_beyond.
+    This isolates the effect of removing long-range information without confounds.
+
     Returns kl_div: (seq_len,) tensor.
-    Tokens within the first trunc_len positions get KL = 0 (truncation has no effect there).
+    Tokens within the first mask_beyond positions get KL = 0 (no masking needed).
     """
     seq_len = input_ids.shape[1]
+    device = input_ids.device
 
     # Full context logits
     full_logits = model(input_ids=input_ids, use_cache=False).logits[0]  # (seq_len, vocab)
-    full_probs = F.softmax(full_logits.float(), dim=-1)
+    full_log_probs = F.log_softmax(full_logits.float(), dim=-1)
 
     kl_divs = torch.zeros(seq_len)
 
-    # For each position t > trunc_len, run truncated forward pass
-    # Batch this: use fixed truncation from position max(0, t - trunc_len) to t
-    # For efficiency, we use a sliding window approach:
-    # group tokens by their truncation window start
-    # Simple approach: for tokens at position >= trunc_len, run one pass with just the last trunc_len tokens
-    if seq_len > trunc_len:
-        trunc_input = input_ids[:, -trunc_len:]
-        trunc_logits = model(trunc_input, use_cache=False).logits[0]  # (trunc_len, vocab)
-        trunc_probs = F.softmax(trunc_logits.float(), dim=-1)
+    if seq_len <= mask_beyond:
+        return kl_divs
 
-        # Align: truncated pass covers the last trunc_len positions of the full sequence
-        offset = seq_len - trunc_len
-        for i in range(trunc_len):
-            t = offset + i
-            kl = F.kl_div(
-                trunc_probs[i].log(),
-                full_probs[t],
-                reduction="sum",
-            ).item()
-            kl_divs[t] = max(kl, 0.0)  # numerical safety
+    # Build custom attention mask: for each query position t, allow attending to
+    # positions j in [max(0, t - mask_beyond), t] only (causal + distance limit).
+    # Shape: (1, 1, seq_len, seq_len) — 0 = attend, large negative = mask
+    positions = torch.arange(seq_len, device=device)
+    # dist[t, j] = t - j (positive for causal positions)
+    dist = positions.unsqueeze(1) - positions.unsqueeze(0)  # (seq_len, seq_len)
+    # Allow: j <= t (causal) AND t - j <= mask_beyond
+    causal_mask = dist >= 0
+    distance_mask = dist <= mask_beyond
+    combined = causal_mask & distance_mask  # (seq_len, seq_len)
+    # Convert to float mask: 0 where allowed, -inf where blocked
+    attn_mask = torch.zeros(1, 1, seq_len, seq_len, device=device, dtype=model.dtype)
+    attn_mask.masked_fill_(~combined.unsqueeze(0).unsqueeze(0), torch.finfo(model.dtype).min)
+
+    masked_logits = model(
+        input_ids=input_ids,
+        attention_mask=attn_mask,
+        use_cache=False,
+    ).logits[0]  # (seq_len, vocab)
+    masked_log_probs = F.log_softmax(masked_logits.float(), dim=-1)
+
+    # KL(P_full || P_masked) per token
+    # = sum_v P_full(v) * (log P_full(v) - log P_masked(v))
+    kl_per_token = F.kl_div(masked_log_probs, full_log_probs.exp(), reduction="none", log_target=False).sum(dim=-1)
+    kl_divs = kl_per_token.clamp(min=0).cpu()
+
+    # Zero out positions where masking has no effect (first mask_beyond positions)
+    kl_divs[:mask_beyond] = 0.0
 
     return kl_divs
 
@@ -249,6 +291,28 @@ def build_frequency_table(chunks):
 # ---------------------------------------------------------------------------
 # Step 5: Correlation analysis
 # ---------------------------------------------------------------------------
+
+def shuffle_null_baseline(exit_layers, metric, n_permutations: int = 1000):
+    """
+    Compute null distribution of Spearman rho by shuffling exit_layers.
+    Returns observed rho, p-value from permutation test, and null distribution stats.
+    """
+    observed_rho, _ = stats.spearmanr(exit_layers, metric)
+    null_rhos = np.zeros(n_permutations)
+    shuffled = exit_layers.copy()
+    for i in range(n_permutations):
+        np.random.shuffle(shuffled)
+        null_rhos[i], _ = stats.spearmanr(shuffled, metric)
+    p_perm = (np.abs(null_rhos) >= abs(observed_rho)).mean()
+    return {
+        "observed_rho": float(observed_rho),
+        "permutation_p": float(p_perm),
+        "null_mean": float(null_rhos.mean()),
+        "null_std": float(null_rhos.std()),
+        "null_95": float(np.percentile(np.abs(null_rhos), 95)),
+    }
+
+
 
 def partial_spearman(x, y, covariate):
     """Spearman correlation between x and y after linearly removing covariate."""
@@ -440,6 +504,8 @@ def main():
     # Build frequency table
     freq_table = build_frequency_table(chunks)
 
+    sweep_thresholds = (32, 64, 128, 256, 512)
+
     all_exit_layers = []
     all_attn_dist = []
     all_lr_mass = []
@@ -448,20 +514,21 @@ def main():
     all_lr_mass_at_exit = []
     all_lr_mass_at_final = []
     all_lr_mass_growth = []
+    all_lr_mass_by_threshold = {th: [] for th in sweep_thresholds}
 
     for i, chunk in enumerate(chunks):
         print(f"Processing chunk {i+1}/{len(chunks)}...", end="\r")
         input_ids = torch.tensor([chunk], dtype=torch.long).to(model.device)
-        # Targets are the next tokens: shift left by 1, use chunk[1:] as targets
-        # We evaluate predictions at positions 0..seq_len-2 against targets chunk[1..seq_len-1]
         targets = torch.tensor(chunk[1:], dtype=torch.long).to(model.device)
-        eval_input = input_ids  # full chunk as context
+        eval_input = input_ids
 
         # Exit layers: returns (seq_len-1,) array, already aligned with targets
         exit_layers_chunk = compute_exit_layers(model, eval_input, targets)
 
-        # Attention metrics: (seq_len,) → trim last position to match eval_len
-        attn_dist_chunk, lr_mass_chunk, per_layer_lr_mass = compute_attention_metrics(model, eval_input)
+        # Attention metrics with sink filtering and threshold sweep
+        attn_dist_chunk, lr_mass_chunk, per_layer_lr_mass, lr_mass_by_th = compute_attention_metrics(
+            model, eval_input, lr_threshold=args.lr_threshold, sweep_thresholds=sweep_thresholds
+        )
         attn_dist_chunk = attn_dist_chunk[:-1]
         lr_mass_chunk = lr_mass_chunk[:-1]
 
@@ -470,9 +537,9 @@ def main():
             exit_layers_chunk, per_layer_lr_mass
         )
 
-        # KL metric (optional, sampled)
+        # KL metric via per-position attention masking (optional, sampled)
         if not args.no_kl and (i / len(chunks)) < args.kl_sample_rate:
-            kl_chunk = compute_kl_metric(model, eval_input)
+            kl_chunk = compute_kl_metric(model, eval_input, mask_beyond=args.lr_threshold * 2)
             kl_chunk = kl_chunk[:-1]
         else:
             kl_chunk = torch.zeros(len(chunk) - 1)
@@ -485,6 +552,8 @@ def main():
         all_lr_mass_at_exit.append(lr_at_exit)
         all_lr_mass_at_final.append(lr_at_final)
         all_lr_mass_growth.append(lr_growth)
+        for th in sweep_thresholds:
+            all_lr_mass_by_threshold[th].append(lr_mass_by_th[th][:-1].numpy())
 
     print()
 
@@ -496,6 +565,7 @@ def main():
     lr_mass_at_exit = np.concatenate(all_lr_mass_at_exit)
     lr_mass_at_final = np.concatenate(all_lr_mass_at_final)
     lr_mass_growth = np.concatenate(all_lr_mass_growth)
+    lr_mass_sweep = {th: np.concatenate(all_lr_mass_by_threshold[th]) for th in sweep_thresholds}
 
     print(f"Total tokens analyzed: {len(exit_layers)}")
     print(f"Exit layer distribution: mean={exit_layers.mean():.1f}, "
@@ -535,6 +605,23 @@ def main():
     print(f"  LR mass @ exit layer:  rho={prho_exit:.4f}, p={pp_exit:.2e}")
     print(f"  LR mass @ final layer: rho={prho_final:.4f}, p={pp_final:.2e}")
     print(f"  LR mass growth:        rho={prho_growth:.4f}, p={pp_growth:.2e}")
+
+    # --- Shuffle null baseline ---
+    print("\nShuffle null baseline (1000 permutations)...")
+    null_lr_mass = shuffle_null_baseline(exit_layers, lr_mass)
+    null_lr_final = shuffle_null_baseline(exit_layers, lr_mass_at_final)
+    print(f"  lr_mass:       observed={null_lr_mass['observed_rho']:.4f}, "
+          f"null_95={null_lr_mass['null_95']:.4f}, perm_p={null_lr_mass['permutation_p']:.4f}")
+    print(f"  lr_mass@final: observed={null_lr_final['observed_rho']:.4f}, "
+          f"null_95={null_lr_final['null_95']:.4f}, perm_p={null_lr_final['permutation_p']:.4f}")
+
+    # --- Threshold sensitivity sweep ---
+    print(f"\nThreshold sensitivity sweep: {sweep_thresholds}")
+    threshold_rhos = {}
+    for th in sweep_thresholds:
+        rho_th, p_th = stats.spearmanr(exit_layers, lr_mass_sweep[th])
+        threshold_rhos[th] = {"rho": float(rho_th), "p": float(p_th)}
+        print(f"  threshold={th:>4d}: rho={rho_th:.4f}, p={p_th:.2e}")
 
     # Bucket analysis
     buckets_a = bucket_analysis(exit_layers, attn_dist, num_layers)
@@ -585,9 +672,23 @@ def main():
             "lr_mass_at_final": buckets_final,
             "lr_mass_growth": buckets_growth,
         },
+        "null_baseline": {
+            "lr_mass": null_lr_mass,
+            "lr_mass_at_final": null_lr_final,
+        },
+        "threshold_sensitivity": {str(th): v for th, v in threshold_rhos.items()},
         "subgroup_analysis": subgroups,
+        "methodology_notes": {
+            "attention_sink_filter": "First 4 key positions zeroed out before computing attention metrics (Xiao et al. 2024)",
+            "kl_method": "Per-position attention masking (not sequence truncation) to avoid RoPE/LayerNorm confounds",
+            "null_baseline": "1000 permutations of exit_layer to establish chance-level rho distribution",
+            "threshold_sweep": f"lr_mass computed at thresholds {list(sweep_thresholds)} to check monotonicity",
+            "exit_layer_caveat": "Vanilla model logit lens — intermediate layers not trained for prediction. "
+                                 "Results should be validated against a LayerSkip-trained checkpoint.",
+        },
         "interpretation": (
-            "Success: rho > 0.3 for at least one metric after frequency control. "
+            "Success: rho > 0.3 for at least one metric after frequency control, "
+            "exceeding null_95, with monotonic threshold sensitivity. "
             "Marginal: rho in [0.15, 0.3]. Pivot if rho < 0.15. "
             "Layer-specific metrics (at_exit, at_final, growth) test the stronger claim "
             "that hard tokens specifically rely on long-range context at the layers that matter."
