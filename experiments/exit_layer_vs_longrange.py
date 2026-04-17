@@ -32,10 +32,10 @@ def load_model_and_tokenizer(model_name: str):
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
-        device_map="auto",
+        dtype=torch.float16,
         trust_remote_code=True,
     )
+    model = model.cuda() if torch.cuda.is_available() else model
     model.eval()
     return model, tokenizer
 
@@ -79,28 +79,28 @@ def compute_exit_layers(model, input_ids: torch.Tensor, targets: torch.Tensor):
     norm = model.model.norm
     lm_head = model.lm_head
 
-    # Compute predictions at each layer: preds[l, t] = predicted token id
-    preds = torch.zeros(num_layers, seq_len, dtype=torch.long, device=input_ids.device)
+    # We predict token at position t+1 from hidden state at position t.
+    # targets has seq_len-1 entries (chunk[1:]); evaluate positions 0..seq_len-2.
+    eval_len = seq_len - 1  # number of (input, target) pairs
+
+    # Compute predictions at each layer for positions 0..eval_len-1
+    preds = torch.zeros(num_layers, eval_len, dtype=torch.long, device=input_ids.device)
     for l in range(num_layers):
-        h = hidden_states[l + 1]  # (1, seq_len, d), skip embedding layer
+        h = hidden_states[l + 1][:, :eval_len, :]  # (1, eval_len, d)
         h_normed = norm(h)
-        logits = lm_head(h_normed)  # (1, seq_len, vocab)
+        logits = lm_head(h_normed)  # (1, eval_len, vocab)
         preds[l] = logits[0].argmax(dim=-1)
 
     # correct[l, t] = 1 if preds[l, t] == targets[t]
-    correct = (preds == targets.unsqueeze(0))  # (num_layers, seq_len)
+    correct = (preds == targets.unsqueeze(0))  # (num_layers, eval_len)
 
     # exit_layer[t] = earliest l such that correct[l:, t].all()
-    # Compute suffix-AND: suffix_correct[l, t] = correct[l:, t].all()
-    # Walk from last layer to first
     suffix_correct = correct.clone()
     for l in range(num_layers - 2, -1, -1):
         suffix_correct[l] = correct[l] & suffix_correct[l + 1]
 
-    # exit_layer[t] = first l where suffix_correct[l, t] is True
     # If no such l exists, assign num_layers - 1
-    exit_layer = torch.full((seq_len,), num_layers - 1, dtype=torch.long, device=input_ids.device)
-    # Process from last to first so that the earliest True wins
+    exit_layer = torch.full((eval_len,), num_layers - 1, dtype=torch.long, device=input_ids.device)
     for l in range(num_layers - 1, -1, -1):
         exit_layer[suffix_correct[l]] = l
 
@@ -371,13 +371,10 @@ def main():
         targets = torch.tensor(chunk[1:], dtype=torch.long).to(model.device)
         eval_input = input_ids  # full chunk as context
 
-        # Exit layers (only for positions 0..seq_len-2)
+        # Exit layers: returns (seq_len-1,) array, already aligned with targets
         exit_layers_chunk = compute_exit_layers(model, eval_input, targets)
-        # exit_layers_chunk has seq_len entries; position t predicts token t+1
-        # Trim to seq_len-1 to align with targets
-        exit_layers_chunk = exit_layers_chunk[:-1]  # (seq_len-1,)
 
-        # Attention metrics
+        # Attention metrics: (seq_len,) → trim last position to match eval_len
         attn_dist_chunk, lr_mass_chunk = compute_attention_metrics(model, eval_input)
         attn_dist_chunk = attn_dist_chunk[:-1]
         lr_mass_chunk = lr_mass_chunk[:-1]
